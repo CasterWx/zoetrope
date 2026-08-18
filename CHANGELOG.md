@@ -1,6 +1,6 @@
 <img src="https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope.svg" width="300" />
 
-[**zoetrope**](https://github.com/furkankly/zoetrope): Watch a Claude Code session as a live flow graph, in your terminal — or your browser.
+[**zoetrope**](https://zoetrope.furkankly.dev): Watch a Claude Code session as a live flow graph, in your terminal — or your browser.
 
 ## 0.1.0 - 2026-08-18
 
