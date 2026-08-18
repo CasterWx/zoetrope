@@ -325,13 +325,21 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    // Rotation is detected by file identity, which only exists on unix:
+    // `file_identity` returns None elsewhere, so a rotated-in longer file is
+    // indistinguishable from an append on Windows. Truncation (`len < offset`)
+    // is still caught everywhere, which the test above covers.
+    #[cfg(unix)]
     #[test]
     fn read_appended_detects_rotation_to_longer_file() {
         use std::io::Write;
 
         let mut tmp = std::env::temp_dir();
         tmp.push(format!("zoetrope_rotate_test_{}.jsonl", std::process::id()));
+        let mut incoming = std::env::temp_dir();
+        incoming.push(format!("zoetrope_rotate_new_{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&incoming);
 
         let mut state = TailState::default();
         {
@@ -343,13 +351,16 @@ mod tests {
 
         // Replace with a DIFFERENT file (new inode) that is longer than the
         // old offset — the old `len < offset` check alone would read garbage
-        // from mid-file.
-        std::fs::remove_file(&tmp).unwrap();
+        // from mid-file. Renaming a second file over the path is what actually
+        // rotates a log, and it is the only way to guarantee a new inode:
+        // unlink-then-create lets the filesystem hand back the one just freed,
+        // which ext4 routinely does.
         {
-            let mut f = std::fs::File::create(&tmp).unwrap();
+            let mut f = std::fs::File::create(&incoming).unwrap();
             f.write_all(b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n")
                 .unwrap();
         }
+        std::fs::rename(&incoming, &tmp).unwrap();
         let r = read_appended(&tmp, &mut state);
         assert!(matches!(r, ReadResult::Reset));
         assert_eq!(state.offset, 0);
