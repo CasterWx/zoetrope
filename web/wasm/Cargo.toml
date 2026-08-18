@@ -62,9 +62,9 @@ web-sys = { version = "0.3", features = [
 # (single-threaded wasm never contends). The impl has to be picked by the final
 # binary, so it is declared here rather than in the library.
 critical-section = { version = "1", features = ["std"] }
-# Select getrandom's JS backend (both major versions are pulled via ratzilla).
-# Pairs with the getrandom_backend cfg in .cargo/config.toml, next to this file.
-getrandom = { version = "0.3", features = ["wasm_js"] }
-getrandom_v04 = { package = "getrandom", version = "0.4", features = [
-  "wasm_js",
-] }
+
+# critical-section is linked, not called: the `std` feature registers the impl
+# that ratatui-core's layout cache needs on wasm32. Nothing references it by
+# name, so a source scan reads it as unused.
+[package.metadata.cargo-machete]
+ignored = ["critical-section"]
