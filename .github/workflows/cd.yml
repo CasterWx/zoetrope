@@ -6,6 +6,12 @@ name: CD
 on:
   release:
     types: [published]
+  # Re-run the asset and formula steps for an existing tag without republishing.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build assets for"
+        required: true
 
 permissions:
   contents: write
@@ -42,7 +48,7 @@ jobs:
       # the commit that was published.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       # release-plz tags either `v1.2.3` or `zoetrope-v1.2.3` depending on how it
       # reads the workspace, so strip an optional package prefix as well as the v.
@@ -50,7 +56,7 @@ jobs:
         shell: bash
         run: echo "RELEASE_VERSION=$(echo "$TAG" | sed -E 's/^(zoetrope-)?v//')" >> $GITHUB_ENV
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -120,7 +126,7 @@ jobs:
           file: zoetrope-${{ env.RELEASE_VERSION }}-${{ matrix.target }}*
           file_glob: true
           overwrite: true
-          tag: ${{ github.event.release.tag_name }}
+          tag: ${{ github.event.release.tag_name || inputs.tag }}
           repo_token: ${{ secrets.GH_TOKEN }}
 
   # The formula is rendered whole rather than bumped in place: it carries one
@@ -140,7 +146,7 @@ jobs:
 
       - name: Render the formula
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
           # Matches the version parsing in the build job above.
@@ -201,11 +207,13 @@ jobs:
 
       - name: Commit and push
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Each run: block is its own shell, so VERSION does not carry over.
+          VERSION="$(echo "$TAG" | sed -E 's/^(zoetrope-)?v//')"
           git add Formula/zoetrope.rb
           # A re-run of the same release renders an identical formula; committing
           # nothing is the correct outcome, not a failure.
