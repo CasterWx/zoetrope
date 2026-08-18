@@ -1,0 +1,1302 @@
+---
+// The in-browser zoetrope app — a standalone full-screen page (NOT a Starlight
+// docs route). It loads the WebAssembly build (the Rust `web` bin, compiled by
+// `pnpm build:wasm` into /public/wasm) which boots into the bundled demo, then
+// lets you replay your own transcript or — in Chromium — open a session folder
+// and follow it live. Everything runs locally; nothing is uploaded.
+import { Font } from 'astro:assets';
+import Analytics from '../components/Analytics.astro';
+import Seo from '../components/Seo.astro';
+import Schema from '../components/Schema.astro';
+import { REPO_URL } from '../consts.ts';
+const wasmBase = '/wasm';
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <Analytics />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>zoetrope — browser app</title>
+    <meta
+      name="description"
+      content="Run zoetrope in your browser: replay a Claude Code session transcript as a live flow graph, fully locally."
+    />
+    <Schema />
+    <Seo
+      title="zoetrope — browser app"
+      description="Run zoetrope in your browser: replay a Claude Code session transcript as a live flow graph, fully locally."
+    />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <!-- Same self-hosted brand fonts as the landing (Space Mono for the wordmark,
+         JetBrains Mono for UI text), so the top bar reads identically across pages. -->
+    <Font cssVariable="--font-mono" preload />
+    <Font cssVariable="--font-display" preload />
+    <!-- Resolve the wasm's libm `env` imports (fmod/round/critical-section) to the
+         JS shim copied next to the wasm. Must precede the module script below. -->
+    <script type="importmap" is:inline>
+      { "imports": { "env": "/wasm/env.js" } }
+    </script>
+    <style is:inline>
+      :root {
+        --gold: #d7af00;
+        --gold-bright: #f0d56a;
+        --green: #87d787;
+        --ink: #121212;
+        --panel: #1c1c1c;
+        --dim: #585858;
+        --bright: #e6e6e6;
+        --mono: var(--font-mono), ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        --display: var(--font-display), var(--font-mono), ui-monospace, monospace;
+      }
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        background-color: var(--panel);
+        overflow: hidden;
+        font-family: var(--mono);
+        color: var(--bright);
+      }
+      /* Stack the toolbar above the canvas so neither overlaps the other. */
+      body {
+        display: flex;
+        flex-direction: column;
+      }
+      /* The WebGl2 backend fills this — it takes the space left under the bar. */
+      #terminal-container {
+        flex: 1 1 auto;
+        min-height: 0;
+        width: 100%;
+        position: relative;
+      }
+      /* ratzilla makes the WebGl2 canvas focusable (tabindex="0") to capture keys,
+         so the browser draws its default focus ring around the whole canvas on
+         click/keypress. The canvas *is* the app — nothing to tab between inside it —
+         so the ring is just noise. Drop it (the bar buttons/modals keep theirs). */
+      #terminal-container:focus,
+      #terminal-container:focus-visible,
+      #terminal-container canvas:focus,
+      #terminal-container canvas:focus-visible {
+        outline: none;
+      }
+
+      /* ── Top toolbar ─────────────────────────────────────────────────── */
+      .bar {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.5rem 0.75rem;
+        background: var(--ink);
+        border-bottom: 1px solid #2a2a2a;
+        font-size: 0.8rem;
+      }
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        font-family: var(--display);
+        color: var(--bright);
+        font-weight: 700;
+        text-decoration: none;
+        letter-spacing: -0.02em;
+        white-space: nowrap;
+      }
+      .brand:hover {
+        color: var(--gold-bright);
+      }
+      .brand-mark { flex: none; overflow: visible; }
+      /* Carries the pulse for both brands. The header's `.glyph` is now the
+         mark's centre circle, which takes its green from `fill` and only the
+         animation from here; the mobile note's is still a text bullet and uses
+         the `color`. */
+      .brand .glyph {
+        color: var(--green);
+        animation: pulse 2s ease-in-out infinite;
+      }
+      @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+      .spacer {
+        flex: 1;
+      }
+      button.act,
+      label.act {
+        font-family: var(--mono);
+        font-size: 0.78rem;
+        color: var(--bright);
+        background: var(--panel);
+        border: 1px solid #343434;
+        border-radius: 6px;
+        padding: 0.32rem 0.7rem;
+        cursor: pointer;
+        white-space: nowrap;
+        transition: border-color 0.12s, color 0.12s, background 0.12s;
+      }
+      button.act:hover,
+      label.act:hover {
+        border-color: var(--gold);
+        color: var(--gold-bright);
+      }
+      button.act.primary {
+        border-color: var(--gold);
+        color: #1a1500;
+        background: var(--gold);
+        font-weight: 600;
+      }
+      button.act.primary:hover {
+        background: var(--gold-bright);
+        border-color: var(--gold-bright);
+      }
+      button.act:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+        border-color: #343434;
+        color: var(--dim);
+      }
+      .link {
+        color: var(--dim);
+        text-decoration: none;
+      }
+      .link:hover {
+        color: var(--bright);
+      }
+
+      /* ── Status text (lives in the top bar, next to the wordmark) ──────── */
+      .statusbar {
+        font-size: 0.74rem;
+        color: var(--dim);
+        max-width: min(48vw, 560px);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .statusbar .dot {
+        color: var(--green);
+      }
+      .statusbar.err {
+        color: #f0a0a0;
+      }
+      @media (max-width: 860px) {
+        .statusbar { display: none; }
+      }
+
+      /* ── Drag overlay ────────────────────────────────────────────────── */
+      .drop {
+        position: fixed;
+        inset: 0;
+        z-index: 20;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        background: rgba(18, 18, 18, 0.82);
+        border: 2px dashed var(--gold);
+        color: var(--gold-bright);
+        font-size: 1.1rem;
+      }
+      .drop.show {
+        display: flex;
+      }
+
+      /* ── Mobile notice: the graph wants a desktop ──────────────────────── */
+      .mnote { display: none; }
+      @media (max-width: 700px) {
+        .mnote {
+          position: fixed;
+          inset: 0;
+          z-index: 60;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 1.5rem;
+          background: rgba(13, 13, 13, 0.94);
+        }
+        .mnote.dismissed { display: none; }
+      }
+      .mnote-card {
+        max-width: 22rem;
+        background: var(--ink);
+        border: 1px solid #343434;
+        border-radius: 12px;
+        padding: 1.3rem 1.35rem 1.4rem;
+      }
+      .mnote-brand {
+        font-family: var(--display);
+        font-weight: 700;
+        color: var(--bright);
+        margin-bottom: 0.7rem;
+      }
+      .mnote-brand .glyph { color: var(--green); }
+      .mnote-card h2 {
+        font-family: var(--display);
+        font-size: 1.05rem;
+        letter-spacing: -0.01em;
+        margin: 0 0 0.55rem;
+        color: var(--gold-bright);
+      }
+      .mnote-card p {
+        margin: 0 0 1.1rem;
+        font-size: 0.86rem;
+        line-height: 1.55;
+        color: #b6b6b6;
+      }
+      .mnote-card button {
+        width: 100%;
+        font-family: var(--mono);
+        font-size: 0.82rem;
+        color: var(--bright);
+        background: var(--panel);
+        border: 1px solid #343434;
+        border-radius: 7px;
+        padding: 0.55rem 0.9rem;
+        cursor: pointer;
+        transition: border-color 0.12s, color 0.12s;
+      }
+      .mnote-card button:hover { border-color: var(--gold); color: var(--gold-bright); }
+
+      /* ── Session picker modal ─────────────────────────────────────────── */
+      .modal {
+        position: fixed;
+        inset: 0;
+        z-index: 30;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        background: rgba(10, 10, 10, 0.78);
+      }
+      .modal.show {
+        display: flex;
+      }
+      .modal-panel {
+        width: min(92vw, 640px);
+        max-height: 78vh;
+        display: flex;
+        flex-direction: column;
+        background: var(--ink);
+        border: 1px solid #343434;
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
+      }
+      .modal-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.7rem 0.9rem;
+        border-bottom: 1px solid #2a2a2a;
+        font-size: 0.85rem;
+        color: var(--gold-bright);
+      }
+      .modal-actions {
+        display: flex;
+        align-items: center;
+        gap: 0.85rem;
+      }
+      .modal-link {
+        background: none;
+        border: none;
+        color: var(--dim);
+        cursor: pointer;
+        font-family: var(--mono);
+        font-size: 0.72rem;
+      }
+      .modal-link:hover {
+        color: var(--gold-bright);
+      }
+      .modal-x {
+        background: none;
+        border: none;
+        color: var(--dim);
+        cursor: pointer;
+        font-size: 0.9rem;
+        font-family: var(--mono);
+      }
+      .modal-x:hover {
+        color: var(--bright);
+      }
+
+      /* ── Pre-picker guidance modal ───────────────────────────────────── */
+      .help-body {
+        padding: 0.95rem 1.1rem 1.15rem;
+        font-size: 0.85rem;
+        line-height: 1.6;
+      }
+      .help-body p { margin: 0 0 0.6rem; }
+      .help-dim { color: var(--dim); }
+      .list-note {
+        margin: 0 0 0.65rem;
+        padding: 0.55rem 0.7rem;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: rgba(215, 175, 0, 0.05);
+        color: var(--dim);
+        font-size: 0.78rem;
+        line-height: 1.5;
+      }
+      .help-body code {
+        background: var(--panel);
+        border: 1px solid #343434;
+        border-radius: 5px;
+        padding: 0.1rem 0.42rem;
+        color: var(--gold-bright);
+      }
+      .copy-btn {
+        margin-left: 0.45rem;
+        font-family: var(--mono);
+        font-size: 0.72rem;
+        color: var(--dim);
+        background: none;
+        border: 1px solid #343434;
+        border-radius: 5px;
+        padding: 0.05rem 0.42rem;
+        cursor: pointer;
+        transition: color 0.12s, border-color 0.12s;
+      }
+      .copy-btn:hover { color: var(--bright); border-color: var(--gold); }
+      .help-steps {
+        margin: 0.5rem 0 1rem;
+        padding-left: 1.25rem;
+        color: var(--bright);
+      }
+      .help-steps li { margin: 0.3rem 0; }
+      .help-body kbd {
+        background: var(--panel);
+        border: 1px solid #343434;
+        border-bottom-width: 2px;
+        border-radius: 4px;
+        padding: 0.02rem 0.34rem;
+        font-family: var(--mono);
+        font-size: 0.78rem;
+        color: var(--bright);
+      }
+      .help-actions { display: flex; gap: 0.6rem; }
+      .session-list {
+        overflow-y: auto;
+        padding: 0.4rem;
+      }
+      .session-row {
+        display: flex;
+        flex-direction: column;
+        gap: 0.15rem;
+        width: 100%;
+        text-align: left;
+        background: none;
+        border: 1px solid transparent;
+        border-radius: 7px;
+        padding: 0.5rem 0.65rem;
+        cursor: pointer;
+        font-family: var(--mono);
+        color: var(--bright);
+      }
+      .session-row:hover {
+        background: var(--panel);
+        border-color: #343434;
+      }
+      .session-row.live:hover {
+        border-color: var(--green);
+      }
+      .s-title {
+        font-size: 0.82rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .s-meta {
+        font-size: 0.7rem;
+        color: var(--dim);
+      }
+      .s-meta .dot {
+        color: var(--green);
+      }
+      .session-empty {
+        padding: 1rem;
+        color: var(--dim);
+        font-size: 0.8rem;
+        line-height: 1.5;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="bar">
+      {/* The mark, inlined and recomposed for 18px — the ring, the elapsed arc
+          and the playhead; the session inside them is three grey pixels at this
+          size and goes. The live agent stays as the centre dot and keeps the
+          pulse the bare `●` carried, so the bar still reads as running. Same
+          treatment as the landing header. */}
+      <a class="brand" href="/">
+        <svg class="brand-mark" viewBox="0 0 32 32" width="18" height="18" aria-hidden="true">
+          <g fill="none" stroke-width="3.5" stroke-dasharray="5.8 2.84">
+            <path d="M16 5 A 11 11 0 1 1 16 27 A 11 11 0 1 1 16 5" stroke="var(--dim)"></path>
+            <path d="M16 5 A 11 11 0 0 1 25.5 21.5" stroke="var(--gold)" opacity="0.55"></path>
+          </g>
+          <line
+            x1="16"
+            y1="2.5"
+            x2="16"
+            y2="7"
+            stroke="var(--gold)"
+            stroke-width="2.6"
+            stroke-linecap="round"
+            transform="rotate(120 16 16)"></line>
+          <circle class="glyph" cx="16" cy="16" r="2.6" fill="var(--green)"></circle>
+        </svg>
+        zoetrope
+      </a>
+      <span id="status" class="statusbar">loading wasm…</span>
+      <span class="spacer"></span>
+
+      <button id="open-folder" class="act primary" title="Browse your Claude sessions and replay or follow one live.">
+        Sessions
+      </button>
+      <input id="dir-input" type="file" webkitdirectory hidden />
+
+      <button id="reset" class="act" title="Reload the bundled demo session">Demo</button>
+
+      <a class="link" href={REPO_URL} target="_blank" rel="noopener">GitHub ↗</a>
+    </div>
+
+    <div id="terminal-container"></div>
+
+    <div id="drop" class="drop">Drop a session's &lt;uuid&gt;.jsonl here (with its &lt;uuid&gt;/ folder for subagents) to replay it, or use “Sessions” to browse your Claude projects.</div>
+
+    <!-- Small-screen heads-up: the graph is dense and needs a mouse/keyboard.
+         Dismissable, so a curious phone visitor can still watch the replay. -->
+    <div id="mobile-note" class="mnote">
+      <div class="mnote-card">
+        <div class="mnote-brand"><span class="glyph">●</span> zoetrope</div>
+        <h2>Built for a bigger screen</h2>
+        <p>The flow graph is dense and made for a larger display. Open zoetrope on a desktop to scrub, zoom, and load your own sessions.</p>
+        <button id="mobile-note-dismiss">Look around anyway</button>
+      </div>
+    </div>
+
+    <div id="session-modal" class="modal">
+      <div class="modal-panel">
+        <div class="modal-head">
+          <span id="session-head">Pick a session</span>
+          <span class="modal-actions">
+            <button id="session-refolder" class="modal-link" title="Choose a different folder">open a different folder…</button>
+            <button id="session-close" class="modal-x" title="Close">✕</button>
+          </span>
+        </div>
+        <div id="session-list" class="session-list"></div>
+      </div>
+    </div>
+
+    <!-- Shown before the OS file dialog: the dialog can't be annotated and won't
+         open ~/.claude/projects on its own, so spell out how to get there. -->
+    <div id="picker-help" class="modal">
+      <div class="modal-panel">
+        <div class="modal-head">
+          <span>Point zoetrope at your sessions</span>
+          <button id="help-close" class="modal-x" title="Close">✕</button>
+        </div>
+        <div class="help-body">
+          <p>
+            Your Claude sessions live in
+            <code id="claude-path">~/.claude/projects</code>
+            <button id="copy-path" class="copy-btn" title="Copy the path">copy</button>
+          </p>
+          <p class="help-dim">The file dialog won't open that folder for you, so:</p>
+          <ol class="help-steps">
+            <li><b>macOS:</b> press <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>G</kbd>, paste the path, then <kbd>return</kbd>.</li>
+            <li><b>Windows / Linux:</b> press <kbd>Ctrl</kbd> <kbd>L</kbd>, or type the path in the location bar.</li>
+            <li>Pick the <b>projects</b> folder, or a single project inside it.</li>
+          </ol>
+          <div class="help-actions">
+            <button id="help-open" class="act primary">Open the file picker →</button>
+            <button id="help-cancel" class="act">Cancel</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script is:inline type="module">
+      import init, { zoetrope_load, zoetrope_append } from '/wasm/web.js';
+
+      const statusEl = document.getElementById('status');
+      const dropEl = document.getElementById('drop');
+      const dirInput = document.getElementById('dir-input');
+      const openFolderBtn = document.getElementById('open-folder');
+      const resetBtn = document.getElementById('reset');
+      const sessionModal = document.getElementById('session-modal');
+      const sessionList = document.getElementById('session-list');
+      const sessionClose = document.getElementById('session-close');
+      const sessionHead = document.getElementById('session-head');
+      const sessionRefolder = document.getElementById('session-refolder');
+      const pickerHelp = document.getElementById('picker-help');
+      const helpOpen = document.getElementById('help-open');
+      const helpCancel = document.getElementById('help-cancel');
+      const helpClose = document.getElementById('help-close');
+      const copyPath = document.getElementById('copy-path');
+
+      let ready = false;
+      let liveState = null;
+      let liveTimer = null;
+      // The last session list shown, so the "Sessions" button can re-open the
+      // picker instantly (change session) without re-picking the folder.
+      let lastSessions = null;
+      let lastRepoName = '';
+
+      function setStatus(msg, isErr = false, live = false) {
+        statusEl.className = 'statusbar' + (isErr ? ' err' : '');
+        statusEl.innerHTML = (live ? '<span class="dot">●</span> ' : '') + escapeHtml(msg);
+      }
+      function escapeHtml(s) {
+        return s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+      }
+
+      // Split `text` into newly-completed lines past `consumed`, holding any
+      // trailing partial line (a file mid-write) until its newline arrives.
+      function freshLines(text, consumed) {
+        const parts = text.split('\n');
+        const complete = Math.max(parts.length - 1, 0); // last element is partial/empty
+        const fresh = parts.slice(consumed, complete).join('\n');
+        return { fresh, consumed: complete };
+      }
+
+      // Classify an arbitrary set of files (an upload or a drop) into a session:
+      // the main transcript (largest non-`agent-` .jsonl) + its subagents.
+      async function buildSession(files) {
+        const subs = {};
+        const sub = (id) => (subs[id] ??= { agent_id: id, meta: '', transcript: '' });
+        const mains = [];
+        const journals = [];
+        for (const f of files) {
+          const name = f.name;
+          const parts = (f.webkitRelativePath || f.zoePath || '').split('/');
+          const wi = parts.indexOf('workflows');
+          const wf = wi >= 0 ? parts[wi + 1] : null;
+          if (name.startsWith('agent-') && name.endsWith('.meta.json')) {
+            const e = sub(name.slice(6, -'.meta.json'.length));
+            e.meta = await f.text();
+            if (wf) e.workflow = wf;
+          } else if (name.startsWith('agent-') && name.endsWith('.jsonl')) {
+            const e = sub(name.slice(6, -'.jsonl'.length));
+            e.transcript = await f.text();
+            if (wf) e.workflow = wf;
+          } else if (name === 'journal.jsonl') {
+            // Never a candidate main transcript — it is a workflow ledger.
+            if (wf) journals.push({ agent_id: '', meta: '', transcript: await f.text(), workflow: wf, journal: true });
+          } else if (name.endsWith('.jsonl')) {
+            mains.push(f);
+          }
+        }
+        // Prefer a real session transcript (<uuid>.jsonl) — so recursing a session
+        // folder doesn't mistake a stray .jsonl (e.g. tool-results) for the main.
+        const uuid = mains.filter((f) => UUID_JSONL.test(f.name));
+        const main = (uuid.length ? uuid : mains).sort((a, b) => b.size - a.size)[0] || null;
+        const mainText = main ? await main.text() : '';
+        return { mainText, mainName: main?.name ?? '', subs: [...Object.values(subs), ...journals] };
+      }
+
+      // Recursively collect File objects from a dropped entry (file or directory),
+      // so dropping a session's `<uuid>/` folder yields the subagents inside it.
+      async function filesFromEntry(entry, out) {
+        if (entry.isFile) {
+          // Stash the tree path: File objects from a drop carry no
+          // webkitRelativePath, and buildSession needs it to spot
+          // `subagents/workflows/<id>/`.
+          await new Promise((res) =>
+            entry.file((f) => ((f.zoePath = entry.fullPath), out.push(f), res()), res),
+          );
+        } else if (entry.isDirectory) {
+          const reader = entry.createReader();
+          const readBatch = () => new Promise((res) => reader.readEntries(res, () => res([])));
+          for (let batch = await readBatch(); batch.length; batch = await readBatch()) {
+            for (const e of batch) await filesFromEntry(e, out);
+          }
+        }
+      }
+
+      // Spawn tool calls in a main transcript (`Task` is the legacy name for
+      // `Agent`). Only used to decide whether to hint about missing sidecars.
+      const SPAWNS_RE = /"name":"(?:Agent|Task|Workflow)"/;
+
+      async function loadFiles(fileList) {
+        if (!ready) return;
+        const files = Array.from(fileList);
+        if (!files.length) return;
+        const { mainText, mainName, subs } = await buildSession(files);
+        if (!mainText) {
+          setStatus('No main .jsonl transcript found in the selection.', true);
+          return;
+        }
+        stopLive();
+        zoetrope_load(mainText, JSON.stringify(subs), false);
+        const n = subs.length;
+        // A drop only carries what was dropped: there is no reference to follow
+        // from a transcript to its sidecars. So a main file that spawned agents
+        // with no subagent files alongside it means the `<uuid>/` folder was left
+        // behind — an easy mistake that otherwise renders as a lone main agent
+        // with nothing to say it is incomplete.
+        if (!n && SPAWNS_RE.test(mainText)) {
+          setStatus(
+            `replaying ${mainName} · main agent only — drop its <uuid>/ folder too to see the subagents it spawned`,
+          );
+        } else {
+          setStatus(`replaying ${mainName} · ${n} subagent${n === 1 ? '' : 's'}`);
+        }
+      }
+
+      // ── Chromium live-follow via the File System Access API ──────────────
+      function stopLive() {
+        if (liveTimer) clearTimeout(liveTimer);
+        liveTimer = null;
+        liveState = null;
+      }
+
+      // The canonical Claude session-transcript name: <session-uuid>.jsonl. This
+      // (plus the `.claude` folder) is what we key detection on — never a generic
+      // `projects/` name, which any repo could have.
+      const UUID_JSONL = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i;
+
+      const getDir = async (parent, name) => {
+        try {
+          return await parent.getDirectoryHandle(name);
+        } catch {
+          return null;
+        }
+      };
+      async function hasUuidJsonl(dir) {
+        for await (const [name, handle] of dir.entries()) {
+          if (handle.kind === 'file' && UUID_JSONL.test(name)) return true;
+        }
+        return false;
+      }
+
+      // A repo transcript folder = `<uuid>.jsonl` mains + same-named `<uuid>/` dirs.
+      async function collectSessions(dir) {
+        const mains = new Map(),
+          dirs = new Map();
+        for await (const [name, handle] of dir.entries()) {
+          if (handle.kind === 'file' && UUID_JSONL.test(name)) mains.set(name.slice(0, -6), handle);
+          else if (handle.kind === 'directory') dirs.set(name, handle);
+        }
+        return mains.size ? { mains, dirs } : null;
+      }
+
+      // Walk from whatever the user picked down to Claude's session data, keyed on
+      // Claude-specific markers only: the `.claude` folder (anchor) and UUID-named
+      // `.jsonl` files (the terminal signal). `projects/` is descended and then
+      // validated by content — never trusted by its name. Returns { repo } for a
+      // single repo folder, { repos } for a `projects/` dir with several, or null.
+      async function detect(dir, depth = 0) {
+        if (depth > 4) return null;
+        // 1. Already a repo transcript folder (has <uuid>.jsonl)?
+        const here = await collectSessions(dir);
+        if (here) return { repo: { name: dir.name, ...here } };
+        // 2. Anchor: descend into `.claude` (from Home or any ancestor).
+        const claude = await getDir(dir, '.claude');
+        if (claude) return detect(claude, depth + 1);
+        // 3. A `projects/` child: descend, but only accept it if the content checks out.
+        const projects = await getDir(dir, 'projects');
+        if (projects) {
+          const r = await detect(projects, depth + 1);
+          if (r) return r;
+        }
+        // 4. This dir's own subdirs are repo folders (e.g. the user picked `projects/`).
+        const repos = [];
+        for await (const [name, handle] of dir.entries()) {
+          if (handle.kind === 'directory' && (await hasUuidJsonl(handle))) repos.push({ name, handle });
+        }
+        return repos.length ? { repos } : null;
+      }
+
+      // Point at anything from Home down to a repo folder; we find the sessions.
+      async function openFolder() {
+        if (!ready) return;
+        // The guidance modal (shown before this) explains how to reach the hidden
+        // ~/.claude/projects target, so here just narrate the picker itself.
+        setStatus('opening the file picker…');
+        let dir;
+        try {
+          dir = await window.showDirectoryPicker({ id: 'zoetrope-sessions', mode: 'read' });
+        } catch (e) {
+          if (e && e.name !== 'AbortError')
+            setStatus('Couldn’t open that folder. In the dialog, use ⌘⇧G and go to ~/.claude/projects.', true);
+          else setStatus('demo · use “Sessions” to browse your sessions, or drop a .jsonl');
+          return;
+        }
+        setStatus('scanning for sessions…');
+        let found;
+        try {
+          found = await detect(dir);
+        } catch (e) {
+          setStatus('Could not read that folder: ' + (e?.message ?? e), true);
+          return;
+        }
+        if (!found) {
+          setStatus('No Claude sessions there. Pick ~/.claude/projects, or a project folder inside it.', true);
+          return;
+        }
+        if (found.repo) {
+          openRepo(found.repo);
+        } else if (found.repos.length === 1) {
+          const s = await collectSessions(found.repos[0].handle);
+          if (s) openRepo({ name: found.repos[0].name, ...s });
+          else setStatus('No sessions in ' + found.repos[0].name, true);
+        } else {
+          showRepoPicker(
+            found.repos
+              .sort((a, b) => a.name.localeCompare(b.name))
+              .map((r) => ({
+                label: prettyRepo(r.name),
+                subtitle: r.name,
+                onPick: async () => {
+                  const s = await collectSessions(r.handle);
+                  if (s) openRepo({ name: r.name, ...s });
+                  else setStatus('No sessions in ' + r.name, true);
+                },
+              }))
+          );
+        }
+      }
+
+      async function openRepo(repo) {
+        showSessionPicker(await buildSessionList(repo.mains, repo.dirs), repo.name);
+      }
+
+      // ── webkitdirectory fallback (Firefox/Safari): a flat FileList, so we group
+      // sessions by parsing `webkitRelativePath` (same <uuid>.jsonl / subagents
+      // markers), instead of navigating handles. Replay only — no live re-read. ──
+      function detectFromFiles(files) {
+        const byRepo = new Map(); // repo path prefix -> Map(uuid -> {uuid, mainFile, subFiles})
+        const repoOf = (p) => byRepo.get(p) ?? byRepo.set(p, new Map()).get(p);
+        const sessionOf = (p, uuid) => {
+          const r = repoOf(p);
+          return r.get(uuid) ?? r.set(uuid, { uuid, mainFile: null, subFiles: {}, journalFiles: {} }).get(uuid);
+        };
+        for (const f of files) {
+          const parts = (f.webkitRelativePath || f.name).split('/');
+          const base = parts[parts.length - 1];
+          if (UUID_JSONL.test(base)) sessionOf(parts.slice(0, -1).join('/'), base.slice(0, -6)).mainFile = f;
+        }
+        for (const f of files) {
+          const parts = (f.webkitRelativePath || f.name).split('/');
+          const base = parts[parts.length - 1];
+          const si = parts.indexOf('subagents');
+          if (si < 1) continue;
+          const s = repoOf(parts.slice(0, si - 1).join('/')).get(parts[si - 1]);
+          if (!s) continue;
+          // `subagents/workflows/<wf>/…` — same agent-<id> convention, one level
+          // down, plus the workflow's journal.jsonl.
+          const wf = parts[si + 1] === 'workflows' ? parts[si + 2] : null;
+          if (wf && base === 'journal.jsonl') {
+            s.journalFiles[wf] = f;
+            continue;
+          }
+          if (!base.startsWith('agent-')) continue;
+          const sub = (id) => (s.subFiles[id] ??= { agent_id: id, transFile: null, metaFile: null, workflow: wf });
+          if (base.endsWith('.meta.json')) sub(base.slice(6, -'.meta.json'.length)).metaFile = f;
+          else if (base.endsWith('.jsonl')) sub(base.slice(6, -'.jsonl'.length)).transFile = f;
+        }
+        const repos = [];
+        for (const [prefix, sessMap] of byRepo) {
+          const sessions = [...sessMap.values()].filter((s) => s.mainFile);
+          if (sessions.length) repos.push({ prefix, sessions });
+        }
+        return repos;
+      }
+
+      async function loadFolderFiles(fileList) {
+        if (!ready) return;
+        const files = Array.from(fileList);
+        if (!files.length) return;
+        setStatus('scanning for sessions…');
+        const repos = detectFromFiles(files);
+        if (!repos.length) {
+          setStatus('No Claude sessions in that folder. Choose ~/.claude/projects, or a project inside it.', true);
+          return;
+        }
+        if (repos.length === 1) openFileRepo(repos[0]);
+        else
+          showRepoPicker(
+            repos
+              .sort((a, b) => a.prefix.localeCompare(b.prefix))
+              .map((r) => {
+                const name = r.prefix.split('/').pop() || r.prefix;
+                return { label: prettyRepo(name), subtitle: r.prefix, onPick: () => openFileRepo(r) };
+              })
+          );
+      }
+
+      async function openFileRepo(r) {
+        const name = r.prefix.split('/').pop() || r.prefix;
+        const sessions = [];
+        for (const s of r.sessions) {
+          let lastModified = 0,
+            size = 0,
+            title = '';
+          try {
+            lastModified = s.mainFile.lastModified;
+            size = s.mainFile.size;
+            title = await previewTitle(s.mainFile);
+          } catch {}
+          sessions.push({
+            uuid: s.uuid,
+            mainFile: s.mainFile,
+            subFiles: Object.values(s.subFiles),
+            journalFiles: s.journalFiles,
+            lastModified,
+            size,
+            title,
+          });
+        }
+        sessions.sort((a, b) => b.lastModified - a.lastModified);
+        showSessionPicker(sessions, name);
+      }
+
+      // Session rows: recency (free) + a title preview (small read). Newest first;
+      // the newest, if written in the last minute, is the active/live session.
+      async function buildSessionList(mains, dirs) {
+        const sessions = [];
+        for (const [uuid, mainHandle] of mains) {
+          let lastModified = 0,
+            size = 0,
+            title = '';
+          try {
+            const file = await mainHandle.getFile();
+            lastModified = file.lastModified;
+            size = file.size;
+            title = await previewTitle(file);
+          } catch {}
+          sessions.push({ uuid, mainHandle, dirHandle: dirs.get(uuid) || null, lastModified, size, title });
+        }
+        sessions.sort((a, b) => b.lastModified - a.lastModified);
+        if (sessions[0] && Date.now() - sessions[0].lastModified < 60000) sessions[0].live = true;
+        return sessions;
+      }
+
+      // A friendlier repo label from the sanitized cwd folder name. Sanitization
+      // maps every non-alphanumeric (incl. both `/` and `-`) to `-`, so it's lossy
+      // — we can't tell path separators from real hyphens. So DON'T fake slashes;
+      // just trim the leading dash and the boilerplate `Users-<name>-` / `home-…`
+      // home prefix. The full folder name is shown as the subtitle for certainty.
+      function prettyRepo(name) {
+        return name.replace(/^-/, '').replace(/^(Users|home|root)-[^-]+-/, '') || name;
+      }
+
+      // Rows: { label, subtitle, onPick }. Shared by the FS-handle and
+      // webkitdirectory paths, which each build their own rows.
+      function showRepoPicker(rows) {
+        sessionHead.textContent = 'Pick a project';
+        sessionList.innerHTML = '';
+        for (const r of rows) {
+          const row = document.createElement('button');
+          row.className = 'session-row';
+          const title = document.createElement('span');
+          title.className = 's-title';
+          title.textContent = r.label;
+          const meta = document.createElement('span');
+          meta.className = 's-meta';
+          meta.textContent = r.subtitle;
+          row.append(title, meta);
+          row.addEventListener('click', r.onPick);
+          sessionList.appendChild(row);
+        }
+        sessionModal.classList.add('show');
+      }
+
+      // First human prompt from the head of a transcript — the session's title.
+      async function previewTitle(file) {
+        try {
+          const head = await file.slice(0, 65536).text();
+          for (const line of head.split('\n')) {
+            if (!line || !line.includes('"type":"user"')) continue;
+            let o;
+            try {
+              o = JSON.parse(line);
+            } catch {
+              continue;
+            }
+            const c = o && o.type === 'user' && o.message && o.message.content;
+            if (typeof c === 'string' && c.trim() && (!o.origin || o.origin.kind === 'human')) {
+              return c.replace(/\s+/g, ' ').trim().slice(0, 90);
+            }
+          }
+        } catch {}
+        return '';
+      }
+
+      function showSessionPicker(sessions, repoName) {
+        lastSessions = sessions; // retained so "Sessions" can re-open instantly
+        lastRepoName = repoName || '';
+        sessionHead.textContent = repoName ? 'Pick a session · ' + prettyRepo(repoName) : 'Pick a session';
+        sessionList.innerHTML = '';
+        // Live-follow needs a directory HANDLE that can be re-read as the file
+        // grows. Without the File System Access API the browser hands over
+        // immutable File snapshots, so following is impossible — say so up front
+        // rather than letting a session silently stop updating.
+        if (!('showDirectoryPicker' in window)) {
+          const note = document.createElement('p');
+          note.className = 'list-note';
+          note.textContent =
+            'This browser can replay a session but not follow one live — it hands over a ' +
+            'snapshot of the files, so later writes never arrive. Live-follow needs Chrome or Edge.';
+          sessionList.appendChild(note);
+        }
+        for (const s of sessions) {
+          const row = document.createElement('button');
+          row.className = 'session-row' + (s.live ? ' live' : '');
+          const title = document.createElement('span');
+          title.className = 's-title';
+          title.textContent = s.title || s.uuid;
+          const meta = document.createElement('span');
+          meta.className = 's-meta';
+          const badge = s.live ? '<span class="dot">●</span> live · ' : '';
+          meta.innerHTML = badge + escapeHtml(`${relTime(s.lastModified)} · ${fmtSize(s.size)} · ${s.uuid.slice(0, 8)}`);
+          row.append(title, meta);
+          row.addEventListener('click', () => {
+            closeSessionPicker();
+            loadSession(s, !!s.live);
+          });
+          sessionList.appendChild(row);
+        }
+        sessionModal.classList.add('show');
+      }
+
+      function closeSessionPicker() {
+        sessionModal.classList.remove('show');
+      }
+
+      // Index a `subagents/` dir into { transcript, meta } handles keyed by agent id.
+      async function indexSubagents(subagentsDir) {
+        const trans = {},
+          metas = {};
+        for await (const [name, handle] of subagentsDir.entries()) {
+          if (handle.kind !== 'file') continue;
+          if (name.startsWith('agent-') && name.endsWith('.jsonl')) trans[name.slice(6, -'.jsonl'.length)] = handle;
+          else if (name.startsWith('agent-') && name.endsWith('.meta.json'))
+            metas[name.slice(6, -'.meta.json'.length)] = handle;
+        }
+        return { trans, metas };
+      }
+
+      // Index `subagents/workflows/` into one entry per workflow: its agent
+      // files (same `agent-<id>` convention as the flat dir, so indexSubagents is
+      // reused verbatim) plus its journal. Mirrors the native tailer's
+      // scan_workflow_ids + scan_subagent_files(wf_dir, Some(wf_id)).
+      async function indexWorkflows(subagentsDir) {
+        const out = [];
+        let wfRoot;
+        try {
+          wfRoot = await subagentsDir.getDirectoryHandle('workflows');
+        } catch {
+          return out;
+        }
+        for await (const [wfId, h] of wfRoot.entries()) {
+          if (h.kind !== 'directory') continue;
+          const { trans, metas } = await indexSubagents(h);
+          let journal = null;
+          try {
+            journal = await h.getFileHandle('journal.jsonl');
+          } catch {}
+          out.push({ wfId, dir: h, trans, metas, journal });
+        }
+        return out;
+      }
+
+      // Collect a workflow's subagents + journal into the `zoetrope_load` payload.
+      // `track` (optional) records read offsets for the live poller.
+      async function pushWorkflowPayload(wfs, out, track) {
+        for (const wf of wfs) {
+          for (const id of Object.keys(wf.trans)) {
+            const text = await (await wf.trans[id].getFile()).text();
+            const meta = wf.metas[id] ? await (await wf.metas[id].getFile()).text() : '';
+            const r = freshLines(text, 0);
+            out.push({ agent_id: id, meta, transcript: r.fresh, workflow: wf.wfId });
+            if (track) track.subs[id] = { handle: wf.trans[id], consumed: r.consumed };
+          }
+          if (wf.journal) {
+            const text = await (await wf.journal.getFile()).text();
+            const r = freshLines(text, 0);
+            out.push({ agent_id: '', meta: '', transcript: r.fresh, workflow: wf.wfId, journal: true });
+            if (track) track.journals[wf.wfId] = { handle: wf.journal, consumed: r.consumed };
+          }
+        }
+      }
+
+      // Load one chosen session: its main + `<uuid>/subagents/`. `live` follows a
+      // growing file (poll loop); otherwise it's a static replay.
+      async function loadSession(s, live) {
+        stopLive();
+        const label = s.title || s.uuid.slice(0, 8);
+        setStatus(`opening ${label}…`);
+        try {
+          // webkitdirectory session (plain File objects) — replay only.
+          if (s.mainFile) {
+            const subs = [];
+            for (const sub of s.subFiles) {
+              subs.push({
+                agent_id: sub.agent_id,
+                meta: sub.metaFile ? await sub.metaFile.text() : '',
+                transcript: sub.transFile ? await sub.transFile.text() : '',
+                workflow: sub.workflow ?? undefined,
+              });
+            }
+            for (const [wfId, f] of Object.entries(s.journalFiles ?? {})) {
+              subs.push({ agent_id: '', meta: '', transcript: await f.text(), workflow: wfId, journal: true });
+            }
+            zoetrope_load(await s.mainFile.text(), JSON.stringify(subs), false);
+            setStatus(`replaying ${label} · ${subs.length} subagent${subs.length === 1 ? '' : 's'}`);
+            return;
+          }
+          // File System Access session (handles) — replay or live.
+          let subagentsDir = null;
+          if (s.dirHandle) {
+            try {
+              subagentsDir = await s.dirHandle.getDirectoryHandle('subagents');
+            } catch {}
+          }
+          const mainText = await (await s.mainHandle.getFile()).text();
+
+          if (live) {
+            const state = { mainHandle: s.mainHandle, mainName: s.uuid, subagentsDir, subs: {}, journals: {}, mainConsumed: 0 };
+            const m = freshLines(mainText, 0);
+            state.mainConsumed = m.consumed;
+            const subsInit = [];
+            if (subagentsDir) {
+              const { trans, metas } = await indexSubagents(subagentsDir);
+              for (const id of Object.keys(trans)) {
+                const text = await (await trans[id].getFile()).text();
+                const meta = metas[id] ? await (await metas[id].getFile()).text() : '';
+                const r = freshLines(text, 0);
+                subsInit.push({ agent_id: id, meta, transcript: r.fresh });
+                state.subs[id] = { handle: trans[id], consumed: r.consumed };
+              }
+              await pushWorkflowPayload(await indexWorkflows(subagentsDir), subsInit, state);
+            }
+            zoetrope_load(m.fresh, JSON.stringify(subsInit), true);
+            liveState = state;
+            setStatus(`live · ${label} · ${subsInit.length} subagent${subsInit.length === 1 ? '' : 's'}`, false, true);
+            liveTimer = setTimeout(pollLive, 1000);
+          } else {
+            const subs = [];
+            if (subagentsDir) {
+              const { trans, metas } = await indexSubagents(subagentsDir);
+              for (const id of Object.keys(trans)) {
+                const transcript = await (await trans[id].getFile()).text();
+                const meta = metas[id] ? await (await metas[id].getFile()).text() : '';
+                subs.push({ agent_id: id, meta, transcript });
+              }
+              await pushWorkflowPayload(await indexWorkflows(subagentsDir), subs, null);
+            }
+            zoetrope_load(mainText, JSON.stringify(subs), false);
+            setStatus(`replaying ${label} · ${subs.length} subagent${subs.length === 1 ? '' : 's'}`);
+          }
+        } catch (e) {
+          setStatus('Failed to open session: ' + (e?.message ?? e), true);
+        }
+      }
+
+      function relTime(ms) {
+        if (!ms) return 'unknown';
+        const s = Math.max(0, (Date.now() - ms) / 1000);
+        if (s < 60) return 'just now';
+        if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+        if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+        return `${Math.floor(s / 86400)}d ago`;
+      }
+      function fmtSize(bytes) {
+        if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
+        if (bytes >= 1e3) return `${Math.round(bytes / 1e3)} KB`;
+        return `${bytes} B`;
+      }
+
+      async function pollLive() {
+        if (!liveState) return;
+        const s = liveState;
+        try {
+          let mainTail = '';
+          const mt = await (await s.mainHandle.getFile()).text();
+          const mr = freshLines(mt, s.mainConsumed);
+          if (mr.fresh) {
+            mainTail = mr.fresh;
+            s.mainConsumed = mr.consumed;
+          }
+
+          const subsOut = [];
+          if (s.subagentsDir) {
+            for await (const [name, handle] of s.subagentsDir.entries()) {
+              if (handle.kind !== 'file' || !name.startsWith('agent-') || !name.endsWith('.jsonl')) continue;
+              const id = name.slice(6, -'.jsonl'.length);
+              let entry = s.subs[id];
+              let meta = '';
+              if (!entry) {
+                // Newly-spawned subagent: read its meta once, on first sight.
+                try {
+                  const mh = await s.subagentsDir.getFileHandle('agent-' + id + '.meta.json');
+                  meta = await (await mh.getFile()).text();
+                } catch {}
+                entry = s.subs[id] = { handle, consumed: 0 };
+              }
+              const text = await (await handle.getFile()).text();
+              const r = freshLines(text, entry.consumed);
+              if (r.fresh || meta) {
+                subsOut.push({ agent_id: id, meta, transcript: r.fresh });
+                entry.consumed = r.consumed;
+              }
+            }
+          }
+
+          // Workflow subagents + journals, same append semantics as the flat dir.
+          if (s.subagentsDir) {
+            for (const wf of await indexWorkflows(s.subagentsDir)) {
+              for (const id of Object.keys(wf.trans)) {
+                let entry = s.subs[id];
+                let meta = '';
+                if (!entry) {
+                  if (wf.metas[id]) meta = await (await wf.metas[id].getFile()).text();
+                  entry = s.subs[id] = { handle: wf.trans[id], consumed: 0 };
+                }
+                const text = await (await wf.trans[id].getFile()).text();
+                const r = freshLines(text, entry.consumed);
+                if (r.fresh || meta) {
+                  subsOut.push({ agent_id: id, meta, transcript: r.fresh, workflow: wf.wfId });
+                  entry.consumed = r.consumed;
+                }
+              }
+              if (wf.journal) {
+                const j = (s.journals[wf.wfId] ??= { handle: wf.journal, consumed: 0 });
+                const text = await (await wf.journal.getFile()).text();
+                const r = freshLines(text, j.consumed);
+                if (r.fresh) {
+                  subsOut.push({ agent_id: '', meta: '', transcript: r.fresh, workflow: wf.wfId, journal: true });
+                  j.consumed = r.consumed;
+                }
+              }
+            }
+          }
+
+          if (mainTail || subsOut.length) zoetrope_append(mainTail, JSON.stringify(subsOut));
+        } catch {
+          // Transient read race against an in-flight write — try again next tick.
+        }
+        if (liveState) liveTimer = setTimeout(pollLive, 1000);
+      }
+
+      // ── Wire up the UI ───────────────────────────────────────────────────
+      resetBtn.addEventListener('click', () => {
+        stopLive();
+        // Reloading re-runs the wasm `main`, which boots the bundled demo.
+        location.reload();
+      });
+
+      // Pick a folder: the File System Access API when available (browse + live),
+      // else the webkitdirectory input (browse, replay). Both land on the same
+      // session picker, so it works in every browser.
+      // The OS file dialog can't be annotated and won't open ~/.claude/projects on
+      // its own, so show the guidance modal first; its button starts the real pick
+      // (which keeps the click's user-activation, required by showDirectoryPicker).
+      function pickFolder() {
+        pickerHelp.classList.add('show');
+      }
+      function reallyPick() {
+        if ('showDirectoryPicker' in window) openFolder();
+        else dirInput.click();
+      }
+      function closeHelp() {
+        pickerHelp.classList.remove('show');
+      }
+      helpOpen.addEventListener('click', () => {
+        closeHelp();
+        reallyPick();
+      });
+      helpCancel.addEventListener('click', closeHelp);
+      helpClose.addEventListener('click', closeHelp);
+      // Small-screen heads-up (CSS-gated to ≤700px); let a curious visitor through.
+      document
+        .getElementById('mobile-note-dismiss')
+        ?.addEventListener('click', () =>
+          document.getElementById('mobile-note').classList.add('dismissed'),
+        );
+      // Click the backdrop (not the panel) to dismiss.
+      pickerHelp.addEventListener('click', (e) => {
+        if (e.target === pickerHelp) closeHelp();
+      });
+      copyPath.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText('~/.claude/projects');
+          copyPath.textContent = 'copied';
+          setTimeout(() => (copyPath.textContent = 'copy'), 1200);
+        } catch {
+          /* clipboard unavailable — the path is right there to type */
+        }
+      });
+      // "Sessions": re-open the picker from the retained list if we've already
+      // loaded a folder (instant change-session, no re-pick); else pick a folder.
+      openFolderBtn.addEventListener('click', () => {
+        if (lastSessions) showSessionPicker(lastSessions, lastRepoName);
+        else pickFolder();
+      });
+      // In-modal escape hatch to point at a different folder.
+      sessionRefolder.addEventListener('click', () => {
+        closeSessionPicker();
+        pickFolder();
+      });
+      dirInput.addEventListener('change', (e) => {
+        loadFolderFiles(e.target.files);
+        e.target.value = ''; // allow re-picking the same folder
+      });
+
+      // Session picker dismissal: ✕, click-outside, or Esc.
+      sessionClose.addEventListener('click', closeSessionPicker);
+      sessionModal.addEventListener('click', (e) => {
+        if (e.target === sessionModal) closeSessionPicker();
+      });
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && sessionModal.classList.contains('show')) closeSessionPicker();
+      });
+
+      // Drag & drop (static replay; folder live-follow is the button above).
+      let dragDepth = 0;
+      window.addEventListener('dragenter', (e) => {
+        e.preventDefault();
+        if (++dragDepth === 1) dropEl.classList.add('show');
+      });
+      window.addEventListener('dragover', (e) => e.preventDefault());
+      window.addEventListener('dragleave', (e) => {
+        e.preventDefault();
+        if (--dragDepth <= 0) {
+          dragDepth = 0;
+          dropEl.classList.remove('show');
+        }
+      });
+      window.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        dragDepth = 0;
+        dropEl.classList.remove('show');
+        // Capture dropped entries synchronously (they're only valid during the
+        // event), then recurse into any folders — so you can drop a session's
+        // `<uuid>.jsonl` and its `<uuid>/` folder together to pull in subagents.
+        const entries = [];
+        if (e.dataTransfer?.items) {
+          for (const item of e.dataTransfer.items) {
+            const entry = item.webkitGetAsEntry?.();
+            if (entry) entries.push(entry);
+          }
+        }
+        let files;
+        if (entries.length) {
+          files = [];
+          for (const entry of entries) await filesFromEntry(entry, files);
+        } else {
+          files = Array.from(e.dataTransfer?.files ?? []);
+        }
+        if (files.length) loadFiles(files);
+      });
+
+      // ── Boot ─────────────────────────────────────────────────────────────
+      try {
+        await init();
+        ready = true;
+        setStatus('demo · use “Sessions” to browse your sessions, or drop a .jsonl');
+      } catch (e) {
+        setStatus('Failed to load the wasm app: ' + (e?.message ?? e), true);
+        throw e;
+      }
+    </script>
+  </body>
+</html>

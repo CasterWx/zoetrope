@@ -1,0 +1,33 @@
+{
+  "name": "zoetrope-web",
+  "type": "module",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Website + in-browser app for zoetrope — the Claude Code session visualizer.",
+  "scripts": {
+    "dev": "astro dev",
+    "start": "astro dev",
+    "build:wasm": "bash scripts/build-wasm.sh",
+    "build": "npm run build:wasm && astro build",
+    "build:site": "astro build",
+    "preview": "astro preview",
+    "astro": "astro",
+    "og": "node scripts/og.mjs"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.41.7",
+    "@vercel/analytics": "^2.0.1",
+    "astro": "^7.2.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "sharp",
+      "esbuild"
+    ]
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "satori": "^0.29.0",
+    "sharp": "^0.35.3"
+  }
+}
