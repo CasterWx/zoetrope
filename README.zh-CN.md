@@ -24,7 +24,7 @@
   <img src="https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope.svg" alt="一个会话被画成流程图：主 agent 在上，它派生的子 agent 在下，底下是工具活动时间线" width="620">
 </p>
 
-<p align="center"><a href="README.md">English</a> · 中文</p>
+<p align="center"><a href="README.md">English</a> · 简体中文</p>
 
 Claude Code 会在 `~/.claude/projects/` 下为每个会话写一份 JSONL transcript。
 zoetrope 读取它，把会话画成终端里的一张图：主 agent、它派生的子 agent 和工作流、
@@ -161,7 +161,7 @@ zoe inspect <file.jsonl>     # 打印会话树并退出（无 TUI）
 
 界面默认跟随系统语言（终端读 `LANG`/`LC_ALL`，浏览器读
 `navigator.language`）。显式指定：启动时加 `--lang zh`（或设 `ZOETROPE_LANG`
-环境变量），运行中按 `L` 在语言之间循环切换。目前提供英文和中文；
+环境变量），运行中按 `L` 在语言之间循环切换。目前提供英文和简体中文；
 `zoe --help` 的用法说明同样按当前语言输出。
 
 ## 底层原理
